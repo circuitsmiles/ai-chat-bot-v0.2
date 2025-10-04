@@ -208,3 +208,6 @@ __marimo__/
 
 # stt model files
 model/
+
+# raw data
+debug_audio_files/

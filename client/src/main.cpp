@@ -1,5 +1,5 @@
 // =================================================================================================
-// TRINITY VOICE ASSISTANT - MAIN FIRMWARE
+// TRINITY VOICE ASSISTANT - MAIN FIRMWARE (FIXED FOR I2S RECORDING/UPLOAD)
 // ESP32-S3 WROOM-1 N16R8 (44-Pin DevKitC-1)
 //
 // This file integrates all components: I2S Mic/Amp, OLED, RGB LED, Secure Wi-Fi, and server communication.
@@ -19,7 +19,6 @@
 #include <Adafruit_NeoPixel.h>
 
 // --- Fix for NVS Global Handle Compiler Conflict ---
-// Including this header ensures 'nvs_handle_t' is defined and 'g_trinity_nvs_handle' is declared as 'extern'.
 #include "nvs_globals.h"
 
 // =================================================================================================
@@ -36,13 +35,14 @@ const char* AP_SSID = "Trinity_Setup";
 const int AP_CHANNEL = 1;
 const int AP_TIMEOUT_MS = 180000; // 3 minutes for AP mode
 
-// --- GPIO Pin Definitions (Verified for 44-pin ESP32-S3 DevKitC-1) ---
+// --- GPIO Pin Definitions (CORRECTED based on your pinout table) ---
 #define PIN_OLED_SDA 21     // I2C Data (J3-18)
-#define PIN_OLED_SCL 41     // I2C Clock (J3-7) - CORRECTED
-#define PIN_I2S_DOUT 25     // I2S TX Data (To MAX98357A DIN)
+#define PIN_OLED_SCL 41     // I2C Clock (J3-7)
+// ** CORRECTED I2S PINS **
+#define PIN_I2S_DOUT 40     // I2S TX Data (To MAX98357A DIN) - **CORRECTED FROM 25**
 #define PIN_I2S_DIN 39      // I2S RX Data (From INMP441 SD/DO)
-#define PIN_I2S_BCLK 40     // I2S Bit Clock (Shared by Mic and Amp)
-#define PIN_I2S_LRCK 37     // I2S Left/Right Clock (Shared by Mic and Amp)
+#define PIN_I2S_BCLK 37     // I2S Bit Clock (Shared by Mic and Amp) - **CORRECTED FROM 40**
+#define PIN_I2S_LRCK 36     // I2S Left/Right Clock (Shared by Mic and Amp) - **CORRECTED FROM 37**
 #define PIN_BUTTON_WAKE 12  // Button 1 (Next/Wake)
 #define PIN_BUTTON_SEND 14  // Button 2 (Stop/Send)
 
@@ -54,8 +54,12 @@ const int AP_TIMEOUT_MS = 180000; // 3 minutes for AP mode
 const i2s_port_t I2S_PORT = I2S_NUM_0;
 const int SAMPLE_RATE = 16000; // Standard rate for speech recognition
 const int CHANNELS = 1;
-const int BITS_PER_SAMPLE = 16;
-const int BUFFER_SIZE = 1024 * 4; // 4KB buffer for audio transmission
+const int BITS_PER_SAMPLE = 16; 
+
+// --- Audio Buffer Configuration ---
+const int MAX_RECORD_SECONDS = 6; // Max 6 seconds of recording to RAM
+const size_t AUDIO_BUFFER_CAPACITY = SAMPLE_RATE * MAX_RECORD_SECONDS * BITS_PER_SAMPLE / 8 * CHANNELS; 
+const size_t I2S_READ_CHUNK_SIZE = 1024 * 2; // Read 2KB at a time
 
 // --- Display Configuration ---
 #define SCREEN_WIDTH 128
@@ -78,10 +82,12 @@ enum Status { STATUS_INITIALIZING, STATUS_WIFI_SETUP, STATUS_CONNECTED, STATUS_L
 Status currentStatus = STATUS_INITIALIZING;
 bool isListening = false;
 bool wifiCredentialsSaved = false;
-bool button1Pressed = false;
-bool button2Pressed = false;
 char saved_ssid[64] = "";
 char saved_pass[64] = "";
+
+// Audio Data Buffer
+size_t audioDataSize = 0; // Current size of data stored in the buffer
+uint8_t audioBuffer[AUDIO_BUFFER_CAPACITY]; // 192KB buffer for recording
 
 // =================================================================================================
 // 3. LED AND DISPLAY FUNCTIONS
@@ -141,7 +147,7 @@ void updateStatus(Status newStatus, const char* message = "") {
             display.setCursor(0, 0);
             display.println("READY.");
             display.setCursor(0, 10);
-            display.println("Press B1/B2 to Speak");
+            display.println("Press B1 to Listen");
             display.setCursor(0, 20);
             display.printf("IP: %s", WiFi.localIP().toString().c_str());
             break;
@@ -149,6 +155,12 @@ void updateStatus(Status newStatus, const char* message = "") {
             display.setTextSize(2);
             display.setCursor(0, 0);
             display.println("LISTENING...");
+            // Show recorded time in seconds
+            display.setTextSize(1);
+            display.setCursor(0, 20);
+            display.printf("Time: %d/%d s", (int)(audioDataSize / (SAMPLE_RATE * 2)), MAX_RECORD_SECONDS);
+            display.setCursor(0, 30);
+            display.println("Press B2 to Stop/Send");
             break;
         case STATUS_THINKING:
             display.setTextSize(2);
@@ -168,6 +180,8 @@ void updateStatus(Status newStatus, const char* message = "") {
             display.println("ERROR!");
             display.setCursor(0, 10);
             display.println(message);
+            display.setCursor(0, 20);
+            display.println("Press B1 to Reset");
             break;
     }
 
@@ -225,7 +239,7 @@ void saveCredentials(const String& ssid, const String& pass) {
 }
 
 // =================================================================================================
-// 5. WIFI AP CONFIGURATION PORTAL
+// 5. WIFI AP CONFIGURATION PORTAL 
 // =================================================================================================
 
 const char CONFIG_HTML[] = R"rawliteral(
@@ -252,7 +266,7 @@ const char CONFIG_HTML[] = R"rawliteral(
             min-height: 100vh;
             margin: 0;
             background-image: linear-gradient(0deg, var(--bg-color) 90%, rgba(57, 255, 20, 0.1) 100%),
-                              linear-gradient(90deg, transparent 99%, rgba(0, 255, 255, 0.1) 100%);
+                                     linear-gradient(90deg, transparent 99%, rgba(0, 255, 255, 0.1) 100%);
             background-size: 50px 50px;
         }
         .container {
@@ -410,7 +424,7 @@ void setupAP() {
 }
 
 // =================================================================================================
-// 6. I2S FUNCTIONS
+// 6. I2S FUNCTIONS (Now using the correct PIN definitions)
 // =================================================================================================
 
 // Helper function to install the I2S driver for Microphone (RX)
@@ -421,19 +435,20 @@ void i2s_mic_init() {
         .sample_rate = SAMPLE_RATE,
         .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
         .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT, // INMP441 uses the left channel slot
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S, // <-- Updated per user's standard
-        .intr_alloc_flags = 0, // <-- Updated per user's suggestion
+        .communication_format = I2S_COMM_FORMAT_STAND_I2S, 
+        .intr_alloc_flags = 0, 
         .dma_buf_count = 8,
         .dma_buf_len = 64,
         .use_apll = false, // Use internal clock
+        .fixed_mclk = 0
     };
 
-    // Pin configuration uses short names (determined by previous trial-and-error)
+    // Pin configuration 
     const i2s_pin_config_t pin_config = {
-        .bck_io_num = PIN_I2S_BCLK,
-        .ws_io_num = PIN_I2S_LRCK,
+        .bck_io_num = PIN_I2S_BCLK, // 37
+        .ws_io_num = PIN_I2S_LRCK,  // 36
         .data_out_num = I2S_PIN_NO_CHANGE, // Not used in RX mode
-        .data_in_num = PIN_I2S_DIN
+        .data_in_num = PIN_I2S_DIN // 39
     };
 
     i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
@@ -449,18 +464,19 @@ void i2s_amp_init() {
         .sample_rate = SAMPLE_RATE,
         .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
         .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT, // MAX98357A is mono, configured for left channel
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S, // <-- Updated per user's standard
-        .intr_alloc_flags = 0, // <-- Updated per user's suggestion
+        .communication_format = I2S_COMM_FORMAT_STAND_I2S, 
+        .intr_alloc_flags = 0,
         .dma_buf_count = 8,
         .dma_buf_len = 64,
         .use_apll = false,
+        .fixed_mclk = 0
     };
 
-    // Pin configuration uses short names (determined by previous trial-and-error)
+    // Pin configuration
     const i2s_pin_config_t pin_config = {
-        .bck_io_num = PIN_I2S_BCLK,
-        .ws_io_num = PIN_I2S_LRCK,
-        .data_out_num = PIN_I2S_DOUT,
+        .bck_io_num = PIN_I2S_BCLK, // 37
+        .ws_io_num = PIN_I2S_LRCK,  // 36
+        .data_out_num = PIN_I2S_DOUT, // 40
         .data_in_num = I2S_PIN_NO_CHANGE // Not used in TX mode
     };
 
@@ -471,7 +487,7 @@ void i2s_amp_init() {
 
 
 void i2s_start_microphone() {
-    // FIX: Dynamic mode switching using uninstall/reinstall because i2s_set_driver_mode is unavailable.
+    // Dynamic mode switching using uninstall/reinstall for mode change
     i2s_driver_uninstall(I2S_PORT); 
     i2s_mic_init(); // Re-initialize driver in RX mode
     i2s_start(I2S_PORT);
@@ -479,10 +495,11 @@ void i2s_start_microphone() {
 
 void i2s_stop_microphone() {
     i2s_stop(I2S_PORT);
+    // Keep the driver installed for quick restart, although some prefer uninstall here.
 }
 
 void i2s_playback_start() {
-    // FIX: Dynamic mode switching using uninstall/reinstall because i2s_set_driver_mode is unavailable.
+    // Dynamic mode switching using uninstall/reinstall for mode change
     i2s_driver_uninstall(I2S_PORT); 
     i2s_amp_init(); // Re-initialize driver in TX mode
     i2s_start(I2S_PORT);
@@ -492,29 +509,28 @@ void i2s_playback_start() {
 // 7. NETWORK REQUEST AND RESPONSE HANDLING
 // =================================================================================================
 
-// This function sends audio data and handles the streaming audio response.
+// This function sends the recorded audio data and handles the streaming audio response.
 void processVoiceCommand() {
+    // 1. Check if we actually recorded anything before sending
+    if (audioDataSize == 0) {
+        updateStatus(STATUS_CONNECTED, "No audio recorded.");
+        Serial.println("Error: No audio data to send.");
+        return;
+    }
+
     updateStatus(STATUS_THINKING);
 
-    // 1. Prepare HTTP Client
+    // 2. Prepare HTTP Client
     httpClient.begin(SERVER_URL);
+    // CRITICAL: Ensure Content-Type is correct for raw PCM audio data
     httpClient.addHeader("Content-Type", "application/octet-stream");
     
-    // 2. Start Recording
-    i2s_start_microphone();
+    // 3. Send the actual recorded audio data
+    Serial.printf("Uploading %u bytes of audio data...\n", audioDataSize);
+    int httpResponseCode = httpClient.sendRequest("POST", (uint8_t*)audioBuffer, audioDataSize);
     
-    // 3. Button Press to Start/Stop Recording
-    
-    i2s_stop_microphone();
-    
-    // --- SIMPLIFIED UPLOAD (Actual implementation would stream a buffer) ---
-    // We send a fixed-size dummy buffer to simulate an audio upload
-    size_t bytes_written = 0;
-    const size_t DUMMY_SIZE = 1024;
-    uint8_t dummy_audio_data[DUMMY_SIZE] = {0}; // Send a zero buffer
-    
-    // FIX: Cast adjusted to non-const (uint8_t*) to satisfy HTTPClient function signature.
-    int httpResponseCode = httpClient.sendRequest("POST", (uint8_t*)dummy_audio_data, DUMMY_SIZE);
+    // Clear the buffer size immediately after sending to be ready for next command
+    audioDataSize = 0; 
 
     if (httpResponseCode > 0) {
         // 4. Handle Audio Response Stream
@@ -523,7 +539,9 @@ void processVoiceCommand() {
             i2s_playback_start();
             
             WiFiClient* stream = httpClient.getStreamPtr();
+            size_t bytes_written = 0;
             size_t availableBytes = 0;
+            uint8_t dummy_audio_data[I2S_READ_CHUNK_SIZE] = {0}; // Reuse chunk buffer for incoming data
             
             // Read until the stream closes or times out
             while (httpClient.connected() || stream->available()) {
@@ -531,7 +549,7 @@ void processVoiceCommand() {
                     availableBytes = stream->available();
                     if (availableBytes > 0) {
                         // Read chunks of data
-                        int bytesRead = stream->readBytes((char*)dummy_audio_data, min(availableBytes, DUMMY_SIZE));
+                        int bytesRead = stream->readBytes((char*)dummy_audio_data, min(availableBytes, I2S_READ_CHUNK_SIZE));
                         if (bytesRead > 0) {
                             // Write PCM audio data to the I2S DAC (MAX98357A)
                             i2s_write(I2S_PORT, dummy_audio_data, bytesRead, &bytes_written, portMAX_DELAY);
@@ -543,16 +561,20 @@ void processVoiceCommand() {
             
             // Playback complete
             i2s_stop(I2S_PORT);
-            updateStatus(STATUS_CONNECTED);
+            updateStatus(STATUS_CONNECTED); // Return to READY state
 
         } else if (httpResponseCode == HTTP_CODE_NOT_ACCEPTABLE) {
             updateStatus(STATUS_ERROR, "Server Error: No Speech Detected.");
+            delay(3000); 
         } else {
-            // FIX: Added .c_str() to convert the concatenated String to const char*
+            // Error response from server (e.g., 500)
             updateStatus(STATUS_ERROR, (String("HTTP Error: ") + String(httpResponseCode)).c_str());
+            delay(3000); 
         }
     } else {
+        // Connection error (e.g., server offline, network down)
         updateStatus(STATUS_ERROR, "Server Connection Failed.");
+        delay(3000);
     }
     
     httpClient.end();
@@ -570,7 +592,8 @@ void setup() {
     
     // 2. LED/Display Init
     rgbLed.begin();
-    Wire.begin(PIN_OLED_SDA, PIN_OLED_SCL); // Initialize I2C for OLED
+    // I2C Init uses the correct pins (21, 41)
+    Wire.begin(PIN_OLED_SDA, PIN_OLED_SCL); 
     if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
         Serial.println(F("SSD1306 allocation failed. Check wiring."));
         updateStatus(STATUS_ERROR, "OLED Fail");
@@ -623,7 +646,6 @@ void setup() {
     
     // 7. Initialize I2S
     // We only call one init function here to ensure the I2S driver is initially loaded. 
-    // The start/playback functions will handle the mode switching via uninstall/reinstall.
     i2s_mic_init(); 
     i2s_stop(I2S_PORT); // Start stopped, will be enabled only when needed
 }
@@ -636,34 +658,68 @@ void loop() {
         return;
     }
 
-    // Only process buttons if connected and not currently speaking/thinking
-    if (currentStatus == STATUS_CONNECTED) {
-        // Read button state
-        button1Pressed = (digitalRead(PIN_BUTTON_WAKE) == LOW);
-        button2Pressed = (digitalRead(PIN_BUTTON_SEND) == LOW);
+    // Status management and button polling
+    bool button1Pressed = (digitalRead(PIN_BUTTON_WAKE) == LOW);
+    bool button2Pressed = (digitalRead(PIN_BUTTON_SEND) == LOW);
 
-        if (button1Pressed && !isListening) {
-            // Start recording (Wake button)
-            isListening = true;
-            updateStatus(STATUS_LISTENING);
-            Serial.println("Started listening...");
-        } else if (button2Pressed && isListening) {
-            // Stop recording and process (Send button)
-            isListening = false;
-            Serial.println("Stopped listening. Processing command...");
-            processVoiceCommand();
-            updateStatus(STATUS_CONNECTED);
-        }
+    switch (currentStatus) {
+        case STATUS_CONNECTED:
+            if (button1Pressed) {
+                // Start recording (Wake button)
+                audioDataSize = 0; // Reset buffer for new recording
+                isListening = true;
+                i2s_start_microphone(); // Start the I2S capture hardware
+                updateStatus(STATUS_LISTENING);
+                Serial.println("Started listening...");
+            }
+            break;
+
+        case STATUS_LISTENING:
+            if (button2Pressed || audioDataSize >= AUDIO_BUFFER_CAPACITY) {
+                // Stop recording and process (Send button or auto-stop)
+                isListening = false;
+                i2s_stop_microphone(); // Stop the I2S capture hardware
+                Serial.println("Stopped listening. Processing command...");
+                
+                // processVoiceCommand() is a blocking call and handles its own status change
+                processVoiceCommand(); 
+            } else if (isListening) {
+                // Read audio data from I2S into the RAM buffer
+                size_t bytesRead = 0;
+                size_t remainingCapacity = AUDIO_BUFFER_CAPACITY - audioDataSize;
+                
+                if (remainingCapacity > 0) {
+                    size_t bytesToRead = min(remainingCapacity, I2S_READ_CHUNK_SIZE);
+                    
+                    // Read data into the buffer starting from the current size offset
+                    // The timeout '10' ms is critical for non-blocking read in the loop
+                    esp_err_t err = i2s_read(I2S_PORT, (char*)(audioBuffer + audioDataSize), bytesToRead, &bytesRead, 10 / portTICK_PERIOD_MS);
+                    
+                    if (err == ESP_OK && bytesRead > 0) {
+                        audioDataSize += bytesRead;
+                        // Update display to show time remaining/recorded
+                        updateStatus(STATUS_LISTENING); 
+                    }
+                }
+                // Short delay for stability and yield control
+                delay(1); 
+                yield();
+                return; // Skip the final delay(50) if actively recording
+            }
+            break;
+
+        case STATUS_ERROR:
+            // Pressing B1 while in ERROR state resets the status
+            if (button1Pressed) {
+                updateStatus(STATUS_CONNECTED);
+            }
+            break;
+            
+        default:
+            // Do nothing, wait for processVoiceCommand or setup to finish
+            break;
     }
-    
-    // During listening state, we would typically be streaming data
-    if (isListening) {
-        // Placeholder for reading audio data (this is where the recording buffer fills up)
-        // In the final design, this would stream the buffer to the server later.
-        delay(10);
-        yield();
-    }
-    
+
     // Simple delay for stability and power saving
     delay(50);
 }
